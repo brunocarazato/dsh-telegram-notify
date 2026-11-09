@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Telegram notifications",
+    "description": "Sends a Telegram message when the agent asks you a question or finishes its work."
+  }
+}

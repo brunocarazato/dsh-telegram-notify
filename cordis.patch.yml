@@ -1,0 +1,16 @@
+# Telegram notifications
+#
+# Bundle patch: inserts the notification plugin into the profile.
+#
+# The bot token is never stored here. It lives in the Harness credential store
+# as the record `telegram-notify/bot` (kind `api-key`), or in the
+# TELEGRAM_BOT_TOKEN environment variable.
+#
+# Every setting, including the chat id and the Markdown formatting switch, is
+# editable in the plugin settings surface. Leave `chatId` empty to let the
+# plugin discover the chat from the first message you send to the bot.
+- insert:
+    - id: telegram-notify
+      name: 'dsh-telegram-notify'
+      config:
+        chatId: ''

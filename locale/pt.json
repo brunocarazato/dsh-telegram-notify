@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Notificações do Telegram",
+    "description": "Envia uma mensagem no Telegram quando o agente faz uma pergunta ou termina o trabalho."
+  }
+}

@@ -1,0 +1,7 @@
+# Normalize line endings so the plugin behaves the same on Windows and WSL.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary

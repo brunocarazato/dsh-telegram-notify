@@ -1,0 +1,19 @@
+# Install artifacts
+node_modules/
+pnpm-lock.yaml
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+
+# Local diagnostics
+_diag*/
+*.tmp
