@@ -13,6 +13,9 @@
 
 const MISSING = Symbol('missing')
 
+/** Keys that would mutate a resolved object's prototype chain. */
+const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
+
 /** The parts one clone-based builder call carries over from its source field. */
 function snapshot(field) {
   return {
@@ -132,6 +135,9 @@ class Field {
         }
         for (const [key, raw] of Object.entries(value)) {
           if (Object.hasOwn(this.dict ?? {}, key)) continue
+          // A configuration key must never reach the prototype chain: an own
+          // `__proto__` entry would otherwise replace the result's prototype.
+          if (FORBIDDEN_KEYS.has(key)) continue
           result[key] = raw
         }
         return result

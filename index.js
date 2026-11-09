@@ -28,24 +28,111 @@ export const TOKEN_ENV = 'TELEGRAM_BOT_TOKEN'
 
 const RECORD_KEY = `${TOKEN_SCOPE}/${TOKEN_ID}`
 const API_ORIGIN = 'https://api.telegram.org'
+/** Telegram bot-token alphabet; anything else could disturb the request URL. */
+const TOKEN_SHAPE = /^[A-Za-z0-9:_-]+$/
 const REFRESH_WINDOW_MS = 2000
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000
 const MAX_CACHED_SESSIONS = 200
+/** Telegram rejects messages over 4096 characters; leave room for markup. */
+const MAX_MESSAGE_CHARS = 4000
+/** Upper bound on the final-answer excerpt kept under the message limit. */
+const MAX_EXCERPT_CHARS = 3000
+/** At most one command reply per chat in this window. */
+const COMMAND_COOLDOWN_MS = 10 * 1000
+/** Cap on chats remembered for the command cooldown. */
+const MAX_TRACKED_CHATS = 64
+
+/**
+ * Secret shapes scrubbed from every outgoing message and log line: an agent
+ * answer can quote a key by accident, and a notification must not deliver it
+ * to Telegram. Order matters only for the private-key block, which is matched
+ * before the line-oriented patterns.
+ */
+const REDACTIONS = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[redacted private key]'],
+  [/\b\d{6,}:[A-Za-z0-9_-]{30,}\b/g, '[redacted telegram token]'],
+  [/\bsk-[A-Za-z0-9_-]{16,}\b/g, '[redacted api key]'],
+  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[redacted aws key]'],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, '[redacted github token]'],
+  [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[redacted slack token]'],
+  [/\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*/gi, 'Bearer [redacted]'],
+  [/\b((?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|secret|token)\s*[:=]\s*)(["']?)([^\s"'`,;]{8,})\2/gi,
+    (_match, prefix, quote) => `${prefix}${quote}[redacted]${quote}`]
+]
+
+/**
+ * Mask common secret shapes in free text before it leaves the machine.
+ * @param text - text that may quote a credential.
+ * @returns the text with known secret shapes replaced.
+ */
+export function redactSecrets(text) {
+  let output = String(text ?? '')
+  for (const [pattern, replacement] of REDACTIONS) output = output.replace(pattern, replacement)
+  return output
+}
+
+/** Describe one error without ever echoing a secret into the log. */
+function sanitizeError(error, secret) {
+  let message = error instanceof Error ? error.message : String(error)
+  if (typeof secret === 'string' && secret !== '') message = message.replaceAll(secret, '[redacted]')
+  return message
+}
+
+/** A short, non-reversible fingerprint used only to dedupe auth warnings. */
+function fingerprint(value) {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16)
+}
+
+/**
+ * Split plain text into Telegram-sized chunks without breaking escape markup
+ * (the caller only uses this path with no `parse_mode`).
+ * @param text - plain text to split.
+ * @param max - maximum characters per chunk.
+ * @returns one or more non-empty chunks.
+ */
+function splitPlain(text, max) {
+  const chunks = []
+  let current = ''
+  for (const line of String(text ?? '').split('\n')) {
+    let rest = line
+    while (rest.length > max) {
+      if (current !== '') {
+        chunks.push(current)
+        current = ''
+      }
+      chunks.push(rest.slice(0, max))
+      rest = rest.slice(max)
+    }
+    if (current !== '' && current.length + 1 + rest.length > max) {
+      chunks.push(current)
+      current = rest
+    } else {
+      current = current === '' ? rest : `${current}\n${rest}`
+    }
+  }
+  if (current !== '') chunks.push(current)
+  return chunks.length > 0 ? chunks : ['']
+}
 
 /** Configuration schema shown by the plugin settings surface. Every field is
  * volatile so edits apply live through the settings form without remounting. */
 export const Config = createSchema({
   enabled: z.boolean().default(true).volatile().description('Enviar notificações no Telegram.'),
-  chatId: z.string().default('').volatile().description('Chat ID que recebe as notificações; vazio descobre a partir de uma mensagem enviada ao bot.'),
+  chatId: z.string().default('').volatile().description('Chat ID numérico que recebe as notificações. Envie /start ao bot para descobri-lo; vazio desliga a entrega.'),
   notifyQuestions: z.boolean().default(true).volatile().description('Notificar quando o agente fizer uma pergunta.'),
   notifyFinished: z.boolean().default(true).volatile().description('Notificar quando um agente de nível raiz terminar o trabalho.'),
   formatMarkdown: z.boolean().default(true).volatile().description('Formatar Markdown (negrito, listas, código, links) no estilo do Telegram em vez de enviar o texto cru.'),
   minTurnDurationMs: z.number().default(8000).volatile().description('Duração mínima de uma execução para notificar o fim; execuções mais curtas ficam silenciosas.'),
-  includeResponse: z.boolean().default(true).volatile().description('Incluir um trecho da resposta final na notificação de conclusão.'),
-  excerptChars: z.number().default(900).volatile().description('Tamanho máximo do trecho da resposta final.'),
+  includeResponse: z.boolean().default(false).volatile().description('Incluir um trecho da resposta final na notificação de conclusão. Desligado por padrão: a resposta pode conter dados sensíveis.'),
+  excerptChars: z.number().default(900).volatile().description('Tamanho máximo do trecho da resposta final (máximo 3000).'),
   silentHours: z.array(z.string()).default([]).volatile().description('Intervalos locais "HH:MM-HH:MM" em que a mensagem é enviada sem som.'),
   locale: z.enum(['pt-BR', 'en']).default('pt-BR').volatile().description('Idioma do texto das notificações.'),
-  apiOrigin: z.string().default(API_ORIGIN).volatile().description('Origem da Bot API; altere apenas para um proxy ou servidor de teste.'),
+  apiOrigin: z.string().default(API_ORIGIN).volatile().description('Origem da Bot API; exige https (http apenas para localhost). Altere apenas para um proxy confiável.'),
   timeoutMs: z.number().default(10000).volatile().description('Tempo limite das requisições à Bot API, em milissegundos.'),
   dedupeMs: z.number().default(3000).volatile().description('Janela mínima entre notificações idênticas repetidas.')
 })
@@ -57,7 +144,7 @@ const DEFAULTS = {
   notifyFinished: true,
   formatMarkdown: true,
   minTurnDurationMs: 8000,
-  includeResponse: true,
+  includeResponse: false,
   excerptChars: 900,
   silentHours: [],
   locale: 'pt-BR',
@@ -73,9 +160,9 @@ const TEXT = {
     unfinished: 'O agente parou sem terminar o trabalho',
     failed: 'O agente parou com erro',
     session: 'Conversa',
-    help: (chatId) => `Chat ID: ${chatId}\nPronto! Este chat vai receber as notificações do DeepSeek Harness.`,
+    help: (chatId) => `Chat ID: ${chatId}\nCopie este número para "Chat ID" em Plugins → Notificações do Telegram e salve. Só depois disso as notificações chegam neste chat.`,
     ok: 'Notificações do DeepSeek Harness ativadas neste chat.',
-    start: 'Ativar notificações deste chat'
+    start: 'Mostrar o chat ID deste chat'
   },
   en: {
     question: 'The agent is waiting for your answer',
@@ -83,9 +170,9 @@ const TEXT = {
     unfinished: 'The agent stopped before finishing',
     failed: 'The agent stopped with an error',
     session: 'Conversation',
-    help: (chatId) => `Chat ID: ${chatId}\nYou are all set! This chat receives DeepSeek Harness notifications.`,
+    help: (chatId) => `Chat ID: ${chatId}\nPaste this number into "Chat ID" in Plugins → Telegram notifications and save. Only then will notifications reach this chat.`,
     ok: 'DeepSeek Harness notifications are enabled for this chat.',
-    start: 'Enable notifications for this chat'
+    start: 'Show this chat ID'
   }
 }
 
@@ -93,7 +180,14 @@ const TEXT = {
 
 const ESCAPE = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }
 
-/** Escape text for the Telegram HTML dialect. */
+/** Schemes a notification may link to; anything else stays inert text. */
+const LINK_SCHEMES = /^(?:https?:\/\/|tg:\/\/|mailto:)/i
+
+/**
+ * Escape text for the Telegram HTML dialect.
+ * @param text - raw text.
+ * @returns escaped text.
+ */
 function escapeHtml(text) {
   return String(text).replaceAll(/[&<>"]/g, (character) => ESCAPE[character])
 }
@@ -113,11 +207,11 @@ function renderInline(text, links) {
 
   work = work.replace(/(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/g, (_match, _ticks, code) => hold(`<code>${code.trim()}</code>`))
 
-  work = work.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_match, alt, url) => hold(links
+  work = work.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_match, alt, url) => hold(LINK_SCHEMES.test(url) && links
     ? `<a href="${url}">${alt === '' ? '🖼 imagem' : alt}</a>`
     : (alt === '' ? 'imagem' : alt)))
 
-  work = work.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_match, label, url) => hold(links
+  work = work.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_match, label, url) => hold(LINK_SCHEMES.test(url) && links
     ? `<a href="${url}">${label}</a>`
     : `${label} (${url})`))
 
@@ -315,38 +409,106 @@ export async function apply(ctx, rawConfig) {
   const log = ctx.logger
   const lang = config.locale === 'en' ? TEXT.en : TEXT.pt
   const state = {
-    chats: new Set(),
-    chatId: typeof config.chatId === 'string' ? config.chatId.trim() : '',
     sessions: new Map(),
     cache: { at: 0, messages: [] },
     dedupe: new Map(),
+    commands: new Map(),
     offset: 0,
     token: undefined,
     tokenCheckedAt: 0,
-    authFailure: undefined
+    authFailure: undefined,
+    warnedNoChat: false,
+    warnedBadChat: false,
+    warnedBadToken: false,
+    warnedEnvToken: false,
+    commandsRegistered: false
   }
+
+  /** Read one numeric setting and keep it inside a safe range. */
+  const num = (key, min, max) => {
+    const value = Number(live(key))
+    return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : DEFAULTS[key]
+  }
+
+  /**
+   * The notification destination. Deliberately explicit: an empty or malformed
+   * id disables delivery instead of trusting the first chat that messages the
+   * bot (any stranger would otherwise be able to bind the bot to their chat).
+   */
+  function configuredChatId() {
+    const value = String(live('chatId') ?? '').trim()
+    if (value === '') return ''
+    if (!/^-?\d+$/.test(value)) {
+      if (!state.warnedBadChat) {
+        state.warnedBadChat = true
+        log.warn('telegram-notify: chatId must be a numeric Telegram chat id; notifications stay off until it is fixed')
+      }
+      return ''
+    }
+    return value
+  }
+
+  /**
+   * Resolve and validate the Bot API base URL. The bot token travels in the URL
+   * path, so sending it anywhere but a trusted HTTPS endpoint would hand the
+   * credential to that endpoint; plain HTTP is admitted only for a local
+   * test server.
+   */
+  function apiOrigin() {
+    const raw = String(live('apiOrigin') ?? DEFAULTS.apiOrigin).trim()
+    let url
+    try {
+      url = new URL(raw)
+    } catch {
+      throw new Error('apiOrigin is not a valid URL')
+    }
+    if (url.username !== '' || url.password !== '') throw new Error('apiOrigin must not carry credentials')
+    if (url.search !== '' || url.hash !== '') throw new Error('apiOrigin must not carry a query or fragment')
+    const loopback = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]' || url.hostname === '::1'
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
+      throw new Error('apiOrigin must use https (http is allowed only for localhost)')
+    }
+    return `${url.origin}${url.pathname.replace(/\/+$/, '')}`
+  }
+
   log.info('telegram-notify: ativo (perguntas=%s, conclusão=%s, markdown=%s, chat=%s)',
-    String(config.notifyQuestions), String(config.notifyFinished), String(config.formatMarkdown), state.chatId || 'a descobrir')
+    String(config.notifyQuestions), String(config.notifyFinished), String(config.formatMarkdown), configuredChatId() || 'não configurado')
 
   /** Resolve the bot token from the credential record, falling back to the environment. */
   async function readToken(force = false) {
     const now = Date.now()
     if (!force && state.token !== undefined && now - state.tokenCheckedAt < REFRESH_WINDOW_MS) return state.token
     state.tokenCheckedAt = now
+    /** Accept a value only when it is a plausible token and safe inside a URL path. */
+    const admit = (candidate) => {
+      if (candidate === undefined) return undefined
+      if (TOKEN_SHAPE.test(candidate)) return candidate
+      if (!state.warnedBadToken) {
+        state.warnedBadToken = true
+        log.warn('telegram-notify: the configured bot token has invalid characters; expected the BotFather token format')
+      }
+      return undefined
+    }
     let value
     try {
       const info = await ctx.credentials.describeRecord(RECORD_KEY)
       if (info.configured) {
         const record = await ctx.credentials.readRecord(RECORD_KEY)
         const key = record?.kind === 'api-key' ? record.key : undefined
-        if (typeof key === 'string' && key.trim() !== '') value = key.trim()
+        if (typeof key === 'string' && key.trim() !== '') value = admit(key.trim())
       }
     } catch (error) {
       log.warn('telegram-notify: could not read the bot token record: %s', String(error))
     }
     if (value === undefined) {
       const resolved = await ctx.credentials.resolve(TOKEN_ENV)
-      if (resolved !== undefined && typeof resolved.value === 'string' && resolved.value.trim() !== '') value = resolved.value.trim()
+      if (resolved !== undefined && typeof resolved.value === 'string' && resolved.value.trim() !== '') {
+        value = admit(resolved.value.trim())
+        if (value !== undefined && !state.warnedEnvToken) {
+          state.warnedEnvToken = true
+          log.warn('telegram-notify: using %s from the environment; the credential record %s is the safer place for the bot token', TOKEN_ENV, RECORD_KEY)
+        }
+      }
     }
     state.token = value
     return value
@@ -357,26 +519,29 @@ export async function apply(ctx, rawConfig) {
     if (botToken === undefined) return undefined
     let response
     try {
-      response = await fetch(`${config.apiOrigin.replace(/\/$/, '')}/bot${botToken}/${method}`, {
+      response = await fetch(`${apiOrigin()}/bot${botToken}/${method}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body ?? {}),
-        signal: AbortSignal.timeout(config.timeoutMs)
+        signal: AbortSignal.timeout(num('timeoutMs', 1000, 120000))
       })
     } catch (error) {
-      throw new Error(`network: ${String(error)}`)
+      // Never let the URL (which embeds the token) reach a log or an exception.
+      throw new Error(`network: ${sanitizeError(error, botToken)}`)
     }
     const payload = await response.json().catch(() => undefined)
     if (payload !== undefined && payload.ok === false) {
+      const description = redactSecrets(String(payload.description ?? ''))
       if (payload.error_code === 401) {
         state.token = undefined
         state.tokenCheckedAt = 0
-        if (state.authFailure !== botToken) {
-          state.authFailure = botToken
-          log.warn('telegram-notify: o token do bot foi recusado (%s); grave um novo token e ele passa a valer automaticamente', String(payload.description ?? ''))
+        const marker = fingerprint(botToken)
+        if (state.authFailure !== marker) {
+          state.authFailure = marker
+          log.warn('telegram-notify: o token do bot foi recusado (%s); grave um novo token e ele passa a valer automaticamente', description)
         }
       }
-      throw new Error(payload.description ?? `Telegram API error ${String(payload.error_code ?? response.status)}`)
+      throw new Error(description !== '' ? description : `Telegram API error ${String(payload.error_code ?? response.status)}`)
     }
     if (!response.ok) throw new Error(`Telegram API HTTP ${String(response.status)}`)
     return payload
@@ -406,7 +571,9 @@ export async function apply(ctx, rawConfig) {
   function silentNow(now) {
     const date = new Date(now)
     const minutes = date.getHours() * 60 + date.getMinutes()
-    return config.silentHours.some((range) => {
+    const ranges = live('silentHours')
+    if (!Array.isArray(ranges)) return false
+    return ranges.some((range) => {
       const parsed = parseHourRange(range)
       if (parsed === undefined) return false
       return parsed.start <= parsed.end
@@ -415,42 +582,57 @@ export async function apply(ctx, rawConfig) {
     })
   }
 
+  /** Deliver one already-rendered plain-text chunk list with no parse mode. */
+  async function sendPlain(chunks, body) {
+    for (const chunk of chunks) {
+      try {
+        await call('sendMessage', { ...body, text: chunk })
+      } catch (error) {
+        log.warn('telegram-notify: could not send the notification: %s', sanitizeError(error, state.token))
+        return
+      }
+    }
+  }
+
   /**
    * Send one notification. `text` is Markdown when `markdown` is set; the
    * formatted rendering is used when enabled, otherwise the plain text is sent
-   * with no parse mode at all so nothing can be misread as markup.
+   * with no parse mode at all so nothing can be misread as markup. Secrets are
+   * masked before rendering and no message leaves without an explicit chat id.
    */
   async function send(text, options = {}) {
     if (!live('enabled')) return
-    const configured = String(live('chatId') ?? '').trim()
-    const chatId = configured !== '' ? configured : state.chats.values().next().value
-    if (chatId === undefined) {
-      log.warn('telegram-notify: no chat configured yet; send any message to the bot on Telegram')
+    const chatId = configuredChatId()
+    if (chatId === '') {
+      if (!state.warnedNoChat) {
+        state.warnedNoChat = true
+        log.warn('telegram-notify: chatId is not set; notifications stay off. Send /start to the bot to learn the numeric chat id')
+      }
       return
     }
     const markdown = options.markdown === true && live('formatMarkdown')
+    let source = redactSecrets(String(text ?? ''))
+    if (typeof state.token === 'string' && state.token !== '') source = source.replaceAll(state.token, '[redacted]')
     const body = {
       chat_id: chatId,
-      text: markdown ? markdownToTelegramHtml(text) : (options.markdown === true ? markdownToPlain(text) : text),
       disable_web_page_preview: true,
-      ...markdown ? { parse_mode: 'HTML' } : {},
       ...options.silent === true || silentNow(Date.now()) ? { disable_notification: true } : {}
     }
-    try {
-      await call('sendMessage', body)
-    } catch (error) {
-      // A malformed entity must not swallow the notification: resend unformatted.
-      if (!markdown) {
-        log.warn('telegram-notify: could not send the notification: %s', String(error))
-        return
-      }
-      log.warn('telegram-notify: formatted message rejected (%s); sending it as plain text', String(error))
+    if (!markdown) {
+      await sendPlain(splitPlain(source, MAX_MESSAGE_CHARS), body)
+      return
+    }
+    const html = markdownToTelegramHtml(source)
+    if (html.length <= MAX_MESSAGE_CHARS) {
       try {
-        await call('sendMessage', { ...body, text: markdownToPlain(text), parse_mode: undefined })
-      } catch (retry) {
-        log.warn('telegram-notify: could not send the notification: %s', String(retry))
+        await call('sendMessage', { ...body, text: html, parse_mode: 'HTML' })
+        return
+      } catch (error) {
+        // A malformed entity must not swallow the notification: resend unformatted.
+        log.warn('telegram-notify: formatted message rejected (%s); sending it as plain text', sanitizeError(error, state.token))
       }
     }
+    await sendPlain(splitPlain(markdownToPlain(source), MAX_MESSAGE_CHARS), body)
   }
 
   /** Per-session notification facts, refreshed from the log as it grows. */
@@ -501,26 +683,47 @@ export async function apply(ctx, rawConfig) {
     const body = items.filter((item) => item !== '').join('\n\n')
     const now = Date.now()
     const key = `${String(agent?.id ?? '')}:${body}`
+    const dedupeMs = num('dedupeMs', 0, 600000)
     const last = state.dedupe.get(key)
-    if (last !== undefined && now - last < config.dedupeMs) return
+    if (last !== undefined && now - last < dedupeMs) return
     state.dedupe.set(key, now)
-    for (const [entry, at] of state.dedupe) if (now - at > config.dedupeMs) state.dedupe.delete(entry)
+    for (const [entry, at] of state.dedupe) if (now - at > dedupeMs) state.dedupe.delete(entry)
     send([header('❓', lang.question, info), '', truncate(body, 2500)].join('\n'), { markdown: true })
-      .catch((error) => log.warn('telegram-notify: question notification failed: %s', String(error)))
+      .catch((error) => log.warn('telegram-notify: question notification failed: %s', sanitizeError(error, state.token)))
   }
 
   // --- bot commands ------------------------------------------------------
 
+  /**
+   * Answer `/start` and `/help` once per cooldown. When no destination is
+   * configured the reply only echoes this chat's own id so the owner can paste
+   * it into the settings; it never becomes the notification target by itself.
+   */
   async function handleCommand(message) {
     const text = message.text.trim()
     if (!text.startsWith('/')) return
     const command = text.slice(1).split(/\s+/)[0].split('@')[0]
     if (command !== 'start' && command !== 'help') return
+    const chatId = String(message.chatId)
+    const now = Date.now()
+    const last = state.commands.get(chatId)
+    if (last !== undefined && now - last < COMMAND_COOLDOWN_MS) return
+    state.commands.set(chatId, now)
+    if (state.commands.size > MAX_TRACKED_CHATS) {
+      for (const [entry] of state.commands) {
+        if (state.commands.size <= MAX_TRACKED_CHATS) break
+        if (entry !== chatId) state.commands.delete(entry)
+      }
+    }
+    if (state.commandsRegistered !== true) {
+      state.commandsRegistered = true
+      await call('setMyCommands', { commands: [{ command: 'start', description: lang.start }] }).catch(() => {})
+    }
     await call('sendMessage', {
-      chat_id: String(message.chatId),
-      text: lang.help(String(message.chatId)),
+      chat_id: chatId,
+      text: configuredChatId() === '' ? lang.help(chatId) : lang.ok,
       disable_web_page_preview: true
-    }).catch((error) => log.warn('telegram-notify: could not answer the bot command: %s', String(error)))
+    }).catch((error) => log.warn('telegram-notify: could not answer the bot command: %s', sanitizeError(error, state.token)))
   }
 
   let polling = false
@@ -531,20 +734,17 @@ export async function apply(ctx, rawConfig) {
     try {
       const messages = await recentMessages(true)
       let highest = state.offset
+      const configured = configuredChatId()
       for (const message of messages) {
         if (typeof message.updateId === 'number' && message.updateId >= highest) highest = message.updateId + 1
-        state.chats.add(String(message.chatId))
-        if (String(live('chatId') ?? '').trim() === '' && message.text.trim() !== '') {
-          state.chatId = String(message.chatId)
-          await call('setMyCommands', { commands: [{ command: 'start', description: lang.start }] }).catch(() => {})
-          await call('sendMessage', { chat_id: state.chatId, text: lang.ok, disable_web_page_preview: true }).catch(() => {})
-          log.info('telegram-notify: chat %s configured', state.chatId)
-        }
+        // With a destination configured, no other chat gets a reply. With none,
+        // the bot only echoes the sender's own id so it can be configured.
+        if (configured !== '' && String(message.chatId) !== configured) continue
         await handleCommand(message)
       }
       state.offset = highest
     } catch (error) {
-      log.debug('telegram-notify: update polling failed: %s', String(error))
+      log.debug('telegram-notify: update polling failed: %s', sanitizeError(error, state.token))
     } finally {
       polling = false
     }
@@ -557,7 +757,7 @@ export async function apply(ctx, rawConfig) {
     try {
       notifyQuestion(request)
     } catch (error) {
-      log.warn('telegram-notify: question notification failed: %s', String(error))
+      log.warn('telegram-notify: question notification failed: %s', sanitizeError(error, state.token))
     }
     return next()
   }, { prepend: true })
@@ -605,27 +805,30 @@ export async function apply(ctx, rawConfig) {
       lastTurn = 1
     }
     if (lastTurn === 0) return
-    if (Date.now() - startedAt < live('minTurnDurationMs')) return
+    if (Date.now() - startedAt < num('minTurnDurationMs', 0, 86400000)) return
     const { emoji, title } = outcome(end.reason, lang)
     const lines = [header(emoji, title, info)]
     const message = end.reason?.error?.message
     if (typeof message === 'string' && message !== '') lines.push(`_${truncate(message, 300)}_`)
-    const response = live('includeResponse') ? truncate(end.text ?? '', live('excerptChars')) : ''
+    const response = live('includeResponse') === true
+      ? truncate(end.text ?? '', num('excerptChars', 0, MAX_EXCERPT_CHARS))
+      : ''
     if (response !== '') lines.push('', response)
-    send(lines.join('\n'), { markdown: true }).catch((error) => log.warn('telegram-notify: finished notification failed: %s', String(error)))
+    send(lines.join('\n'), { markdown: true }).catch((error) => log.warn('telegram-notify: finished notification failed: %s', sanitizeError(error, state.token)))
   })
 
-  // Discover the chat and enable bot commands in it.
+  // Poll for the chat id and for the bot's /start and /help commands.
   const timer = setInterval(() => {
-    poll().catch((error) => log.debug('telegram-notify: poll cycle failed: %s', String(error)))
+    poll().catch((error) => log.debug('telegram-notify: poll cycle failed: %s', sanitizeError(error, state.token)))
   }, 4000)
   timer.unref?.()
   ctx.effect(() => () => {
     clearInterval(timer)
     state.sessions.clear()
     state.dedupe.clear()
+    state.commands.clear()
   })
-  poll().catch((error) => log.debug('telegram-notify: initial poll failed: %s', String(error)))
+  poll().catch((error) => log.debug('telegram-notify: initial poll failed: %s', sanitizeError(error, state.token)))
 }
 
 // Cordis reads `Config` and the entry fields from the module's default export.

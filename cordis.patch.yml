@@ -7,8 +7,10 @@
 # TELEGRAM_BOT_TOKEN environment variable.
 #
 # Every setting, including the chat id and the Markdown formatting switch, is
-# editable in the plugin settings surface. Leave `chatId` empty to let the
-# plugin discover the chat from the first message you send to the bot.
+# editable in the plugin settings surface. `chatId` is deliberately empty here:
+# delivery stays off until you paste the numeric id that the bot replies with
+# when you send it /start. The plugin never adopts the first chat that messages
+# the bot.
 - insert:
     - id: telegram-notify
       name: 'dsh-telegram-notify'
